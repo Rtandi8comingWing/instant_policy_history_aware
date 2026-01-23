@@ -1,0 +1,92 @@
+# Instant Policy Training Configuration
+# Based on the paper: "Instant Policy: In-Context Imitation Learning via Graph Diffusion"
+
+# Model Architecture
+model:
+  # Geometry Encoder (PointNet++)
+  geometry_encoder:
+    out_channels: 256
+    freeze: true  # Paper: geometry encoder should be frozen
+  
+  # Graph Transformer
+  graph_transformer:
+    hidden_dim: 256
+    num_heads: 8
+    num_layers: 4
+    dropout: 0.1
+  
+  # Diffusion
+  diffusion:
+    num_train_timesteps: 1000
+    num_inference_timesteps: 4  # Paper uses 4 steps at inference
+    beta_schedule: "squaredcos_cap_v2"
+    prediction_type: "epsilon"  # Predict noise
+  
+  # Action space
+  action:
+    prediction_horizon: 8  # Number of future actions to predict
+    action_dim: 9  # 3 (translation) + 6 (rotation 6D) = 9
+    gripper_dim: 1
+
+# Graph Construction
+graph:
+  num_points: 2048  # Points per point cloud
+  k_neighbors: 16  # k-NN for point cloud edges
+  num_ee_nodes: 6  # End-effector nodes (2 pos + 4 ori)
+  num_waypoints: 10  # Waypoints per demonstration
+
+# Training
+training:
+  # Optimizer (Paper: AdamW with lr=1e-5)
+  optimizer:
+    name: "adamw"
+    lr: 1.0e-5
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+  
+  # Scheduler
+  scheduler:
+    name: "cosine"
+    warmup_steps: 1000
+    min_lr: 1.0e-7
+  
+  # Training parameters
+  batch_size: 32
+  num_epochs: 100
+  gradient_clip: 1.0
+  
+  # Loss weights
+  loss:
+    diffusion_weight: 1.0
+    gripper_weight: 0.1
+
+# Data
+data:
+  # Pseudo-demonstration generation
+  pseudo_demo:
+    num_demos_per_task: 2  # Number of demonstrations per pseudo-task
+    num_tasks: 100000  # Number of pseudo-tasks to generate
+    trajectory_length: 20  # Steps per trajectory
+  
+  # Data loading
+  num_workers: 4
+  prefetch_factor: 2
+
+# Inference
+inference:
+  num_demos: 2  # Default number of demonstrations
+  num_diffusion_steps: 4
+  execution_horizon: 8  # How many steps to execute before re-querying
+
+# Hardware
+hardware:
+  device: "cuda"
+  precision: "bf16-mixed"
+  compile_model: false
+
+# Logging
+logging:
+  project_name: "instant_policy"
+  log_every_n_steps: 50
+  save_every_n_epochs: 5
+  checkpoint_dir: "./checkpoints"
