@@ -13,7 +13,12 @@ Key features:
 """
 
 from ip_src.models.graph_diffusion import GraphDiffusion
-from ip_src.models.encoders import PointNetPlusPlusEncoder, PointNetEncoder
+from ip_src.models.encoders import (
+    PointNetPlusPlusEncoder,
+    SAModule,
+    sinusoidal_positional_encoding,
+    load_encoder_from_checkpoint,
+)
 from ip_src.models.graph_transformer import (
     GraphTransformer,
     GraphTransformerLayer,
@@ -26,7 +31,6 @@ from ip_src.models.graph_transformer import (
 from ip_src.models.diffusion import (
     FlowMatchingScheduler,
     FlowMatchingConfig,
-    GeometricFlowModel,
     PositionToTransform,
     compute_flow_loss,
 )
@@ -34,9 +38,11 @@ from ip_src.models.diffusion import (
 __all__ = [
     # Main model
     "GraphDiffusion",
-    # Encoders
+    # Encoders (matching official pretrained weights)
     "PointNetPlusPlusEncoder",
-    "PointNetEncoder",
+    "SAModule",
+    "sinusoidal_positional_encoding",
+    "load_encoder_from_checkpoint",
     # Graph Transformers
     "GraphTransformer",
     "GraphTransformerLayer",
@@ -48,7 +54,7 @@ __all__ = [
     # Flow Matching
     "FlowMatchingScheduler",
     "FlowMatchingConfig",
-    "GeometricFlowModel",
+    # Utilities
     "PositionToTransform",
     "compute_flow_loss",
 ]

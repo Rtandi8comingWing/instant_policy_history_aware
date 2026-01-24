@@ -1,5 +1,5 @@
 """
-Flow Matching / Diffusion for Instant Policy.
+Flow Matching for Instant Policy.
 
 Implements geometric flow-based generation for action prediction.
 Key difference from standard diffusion: outputs geometric flow vectors
@@ -14,7 +14,6 @@ Paper: "Instant Policy: In-Context Imitation Learning via Graph Diffusion" (ICLR
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 from typing import Optional, Tuple, Dict
 from dataclasses import dataclass
 import math
@@ -34,9 +33,12 @@ class FlowMatchingScheduler(nn.Module):
     """
     Flow Matching Scheduler for geometric action generation.
     
-    Uses rectified flow or variance-preserving flow formulation.
+    Uses rectified flow formulation where:
+    - x_t = (1-t) * x_0 + t * x_1 (linear interpolation)
+    - v = x_1 - x_0 (constant velocity)
+    
     The model predicts velocity/flow vectors that move samples
-    from noise to target positions.
+    from noise (t=1) to target positions (t=0).
     """
     
     def __init__(self, config: Optional[FlowMatchingConfig] = None):
@@ -74,9 +76,11 @@ class FlowMatchingScheduler(nn.Module):
         t: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Interpolate between noise (x_1) and target (x_0) at time t.
+        Interpolate between target (x_0) and noise (x_1) at time t.
         
         For rectified flow: x_t = (1-t) * x_0 + t * x_1
+        - At t=0: x_t = x_0 (target)
+        - At t=1: x_t = x_1 (noise)
         
         Args:
             x_0: Target positions [B, ...]
@@ -108,9 +112,12 @@ class FlowMatchingScheduler(nn.Module):
         t: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute target velocity/flow from x_0 to x_1.
+        Compute target velocity/flow from target (x_0) to noise (x_1).
         
-        For rectified flow: v = x_1 - x_0
+        For rectified flow: v = x_1 - x_0 (constant velocity)
+        
+        During training, we predict this velocity v.
+        During inference, we integrate backwards: x_{t-dt} = x_t - dt * v
         
         Args:
             x_0: Target positions [B, ...]
@@ -120,204 +127,11 @@ class FlowMatchingScheduler(nn.Module):
         Returns:
             Target velocity [B, ...]
         """
-        if self.config.flow_type == "rectified":
-            # Rectified flow: constant velocity
-            return x_1 - x_0
-        else:
-            # For VP flow, velocity depends on t
-            while len(t.shape) < len(x_0.shape):
-                t = t.unsqueeze(-1)
-            return x_1 - x_0  # Simplified
-    
-    def step(
-        self,
-        velocity: torch.Tensor,
-        x_t: torch.Tensor,
-        t: float,
-        dt: float,
-    ) -> torch.Tensor:
-        """
-        Single integration step.
-        
-        Args:
-            velocity: Predicted velocity [B, ...]
-            x_t: Current positions [B, ...]
-            t: Current timestep (1 -> 0)
-            dt: Step size (negative since going from 1 to 0)
-        
-        Returns:
-            Updated positions [B, ...]
-        """
-        # Euler integration: x_{t-dt} = x_t - dt * v
-        # Since we go from t=1 to t=0, we ADD velocity
-        x_next = x_t - dt * velocity
-        return x_next
+        # Rectified flow: constant velocity
+        return x_1 - x_0
 
 
-class GeometricFlowModel(nn.Module):
-    """
-    Complete geometric flow model for ghost gripper position generation.
-    
-    This model:
-    1. Takes context from the graph (demo + live observations)
-    2. Predicts flow vectors for ghost gripper node positions
-    3. Iteratively refines positions from noise to target
-    
-    The output is in 3D position space, not a flat action vector.
-    """
-    
-    def __init__(
-        self,
-        hidden_dim: int = 256,
-        num_gripper_nodes: int = 6,
-        prediction_horizon: int = 8,
-        config: Optional[FlowMatchingConfig] = None,
-    ):
-        super().__init__()
-        
-        if config is None:
-            config = FlowMatchingConfig()
-        
-        self.config = config
-        self.hidden_dim = hidden_dim
-        self.num_gripper_nodes = num_gripper_nodes
-        self.prediction_horizon = prediction_horizon
-        self.scheduler = FlowMatchingScheduler(config)
-        
-        # Total ghost nodes
-        self.num_ghost_nodes = prediction_horizon * num_gripper_nodes
-    
-    def training_forward(
-        self,
-        target_positions: torch.Tensor,
-        context_features: Dict[str, torch.Tensor],
-        flow_predictor: nn.Module,
-        edge_index_dict: Dict,
-        edge_attr_dict: Dict,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Training forward pass.
-        
-        Args:
-            target_positions: Target ghost positions [B, horizon, 6, 3]
-            context_features: Context node features from encoder
-            flow_predictor: The ActionDecoder model (ψ)
-            edge_index_dict: Graph edges
-            edge_attr_dict: Edge features
-        
-        Returns:
-            Dictionary with loss components
-        """
-        B = target_positions.shape[0]
-        device = target_positions.device
-        
-        # Flatten target positions
-        target_flat = target_positions.reshape(B, -1, 3)  # [B, horizon*6, 3]
-        
-        # Sample random timesteps
-        t = torch.rand(B, device=device)  # [B]
-        
-        # Sample noise (starting positions)
-        noise = torch.randn_like(target_flat)
-        
-        # Interpolate to get x_t
-        x_t = self.scheduler.interpolate(target_flat, noise, t)  # [B, N, 3]
-        
-        # Get target velocity
-        target_velocity = self.scheduler.get_velocity(target_flat, noise, t)  # [B, N, 3]
-        
-        # Predict velocity (this uses the graph structure)
-        # We need to update the ghost node features with x_t
-        ghost_features = context_features.copy()
-        
-        # The flow predictor outputs [num_ghost, 6] where 6 = 3 trans + 3 rot
-        # For position-based flow, we use 3D position flow
-        pred_flow, pred_gripper = flow_predictor(
-            ghost_features, edge_index_dict, edge_attr_dict
-        )
-        
-        # Extract translation flow (first 3 dims)
-        pred_velocity = pred_flow[..., :3]  # [num_ghost, 3]
-        
-        return {
-            'pred_velocity': pred_velocity,
-            'target_velocity': target_velocity,
-            'pred_gripper': pred_gripper,
-            'timestep': t,
-        }
-    
-    @torch.no_grad()
-    def sample(
-        self,
-        context_features: Dict[str, torch.Tensor],
-        flow_predictor: nn.Module,
-        edge_index_dict: Dict,
-        edge_attr_dict: Dict,
-        graph_builder,  # For updating ghost node features
-        live_gripper_pos: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Sample ghost positions via iterative flow integration.
-        
-        Args:
-            context_features: Encoded context
-            flow_predictor: ActionDecoder model
-            edge_index_dict: Graph edges
-            edge_attr_dict: Edge features
-            graph_builder: GraphBuilder for updating ghost features
-            live_gripper_pos: Live gripper positions [6, 3]
-        
-        Returns:
-            Final ghost positions [horizon, 6, 3]
-            Gripper predictions [horizon, 6, 1]
-        """
-        device = live_gripper_pos.device
-        
-        # Initialize from noise around live gripper
-        x = graph_builder.create_initial_ghost_positions(
-            live_gripper_pos,
-            self.prediction_horizon,
-        )  # [horizon, 6, 3]
-        
-        # Get timesteps
-        timesteps = self.scheduler.inference_timesteps
-        step_sizes = self.scheduler.step_sizes
-        
-        gripper_preds = []
-        
-        # Iterative refinement
-        for i, (t, dt) in enumerate(zip(timesteps, step_sizes)):
-            # Update ghost node features based on current positions
-            # This would rebuild the graph with new positions
-            # For simplicity, we use the current features
-            
-            # Predict flow
-            pred_flow, pred_gripper = flow_predictor(
-                context_features, edge_index_dict, edge_attr_dict
-            )
-            
-            # Extract position flow
-            velocity = pred_flow[..., :3]  # [num_ghost, 3]
-            
-            # Reshape to [horizon, 6, 3]
-            velocity = velocity.view(self.prediction_horizon, self.num_gripper_nodes, 3)
-            
-            # Integration step
-            x = x - dt.item() * velocity
-            
-            gripper_preds.append(pred_gripper)
-        
-        # Use last gripper prediction
-        final_gripper = gripper_preds[-1].view(
-            self.prediction_horizon, self.num_gripper_nodes, 1
-        )
-        
-        return x, final_gripper
-    
-    def set_num_inference_steps(self, num_steps: int):
-        """Update inference steps."""
-        self.scheduler.set_num_inference_steps(num_steps)
-
+# === Utility Functions ===
 
 def compute_flow_loss(
     pred_velocity: torch.Tensor,
@@ -350,6 +164,9 @@ class PositionToTransform:
     Utility to convert ghost positions to SE(3) transforms.
     
     Converts the 6 ghost node positions back to a 4x4 transformation matrix.
+    
+    Note: GraphDiffusion uses SVD-based recovery (svd_se3_recovery) instead,
+    which is more robust. This class is kept as an alternative method.
     """
     
     @staticmethod
@@ -416,45 +233,3 @@ class PositionToTransform:
             transforms.append(T)
         
         return torch.stack(transforms)
-
-
-# Keep DDPM for compatibility but mark as deprecated
-class DDPMScheduler(nn.Module):
-    """
-    DEPRECATED: Use FlowMatchingScheduler instead.
-    
-    Kept for backward compatibility with existing checkpoints.
-    """
-    
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        import warnings
-        warnings.warn(
-            "DDPMScheduler is deprecated. Use FlowMatchingScheduler instead.",
-            DeprecationWarning,
-        )
-        
-        # Wrap FlowMatchingScheduler
-        self.scheduler = FlowMatchingScheduler()
-    
-    def add_noise(self, *args, **kwargs):
-        return self.scheduler.interpolate(*args, **kwargs)
-    
-    def step(self, *args, **kwargs):
-        return self.scheduler.step(*args, **kwargs)
-
-
-class DiffusionActionDecoder(nn.Module):
-    """
-    DEPRECATED: Use GeometricFlowModel instead.
-    
-    Kept for backward compatibility.
-    """
-    
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        import warnings
-        warnings.warn(
-            "DiffusionActionDecoder is deprecated. Use GeometricFlowModel instead.",
-            DeprecationWarning,
-        )

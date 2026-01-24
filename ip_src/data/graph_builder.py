@@ -165,8 +165,8 @@ class GraphBuilder(nn.Module):
     
     def __init__(
         self,
-        num_points: int = 2048,
-        k_neighbors: int = 16,
+        num_points: int = 16,
+        k_neighbors: int = 8,
         num_gripper_nodes: int = 6,
         feature_dim: int = 256,
         num_pos_frequencies: int = 10,
@@ -178,8 +178,10 @@ class GraphBuilder(nn.Module):
         Initialize the Graph Builder.
         
         Args:
-            num_points: Number of points in each point cloud
-            k_neighbors: Number of neighbors for k-NN graph construction
+            num_points: Number of keypoint nodes M from geometry encoder (default: 16)
+                       This is the number of FPS-sampled centroids, NOT raw point cloud size
+            k_neighbors: Number of neighbors for k-NN graph construction (default: 8)
+                        Should be < num_points to avoid self-loops
             num_gripper_nodes: Number of gripper nodes per timestep (default: 6)
             feature_dim: Dimension of node features
             num_pos_frequencies: Frequency bands for position encoding
@@ -246,13 +248,19 @@ class GraphBuilder(nn.Module):
         Build a local graph for a single observation.
         
         Args:
-            point_cloud: Point cloud positions [N, 3] in end-effector frame
-            point_features: Point cloud features [N, feature_dim] from geometry encoder
+            point_cloud: Keypoint positions [M, 3] from geometry encoder (M=16 typically)
+                        These are the sampled centroids, NOT the raw 2048-point cloud
+            point_features: Keypoint features [M, feature_dim] from geometry encoder
             gripper_pose: End-effector pose [4, 4] transformation matrix
             gripper_state: Gripper state [1] (0: closed, 1: open)
         
         Returns:
             LocalGraph containing the hetero graph data
+            
+        Note:
+            The point_cloud and point_features come from PointNetPlusPlusEncoder,
+            which samples M=16 keypoints using FPS and encodes local geometry
+            around each keypoint with NeRF-like positional encoding (Appendix A).
         """
         data = HeteroData()
         device = point_cloud.device
@@ -285,10 +293,13 @@ class GraphBuilder(nn.Module):
         pos_features = self.pos_projection(pos_enc)  # [6, feature_dim]
         
         # 3. Gripper state embedding
+        # Ensure gripper_state is a scalar or 0-dim tensor for embedding lookup
+        if gripper_state.dim() > 0:
+            gripper_state = gripper_state.squeeze()  # Remove extra dimensions
         state_emb = self.gripper_state_embedding(gripper_state.long())  # [feature_dim]
         
-        # Combine features
-        gripper_features = type_emb + pos_features + state_emb.unsqueeze(0)
+        # Combine features (broadcast state_emb to all gripper nodes)
+        gripper_features = type_emb + pos_features + state_emb.unsqueeze(0)  # [6, feature_dim]
         
         data[self.NODE_TYPE_GRIPPER].x = gripper_features
         data[self.NODE_TYPE_GRIPPER].pos = gripper_positions
@@ -296,7 +307,10 @@ class GraphBuilder(nn.Module):
         # === Edges with Features ===
         
         # 1. Point cloud k-NN edges
-        pc_edges = knn_graph(point_cloud, k=self.k_neighbors, loop=False)
+        # Dynamically adjust k to ensure k < num_points (avoid self-loops)
+        num_pc = point_cloud.shape[0]
+        k_actual = min(self.k_neighbors, num_pc - 1)
+        pc_edges = knn_graph(point_cloud, k=k_actual, loop=False)
         data[self.EDGE_TYPE_PC_PC].edge_index = pc_edges
         # Compute edge features
         pc_edge_features = compute_edge_features(
@@ -305,8 +319,7 @@ class GraphBuilder(nn.Module):
         )
         data[self.EDGE_TYPE_PC_PC].edge_attr = self.edge_projection(pc_edge_features)
         
-        # 2. Point cloud to gripper edges (all points connect to all gripper nodes)
-        num_pc = point_cloud.shape[0]
+        # 2. Point cloud to gripper edges (all keypoints connect to all gripper nodes)
         pc_to_gripper_src = torch.arange(num_pc, device=device).repeat_interleave(self.num_gripper_nodes)
         pc_to_gripper_dst = torch.arange(self.num_gripper_nodes, device=device).repeat(num_pc)
         pc_to_gripper_edges = torch.stack([pc_to_gripper_src, pc_to_gripper_dst])
@@ -685,17 +698,3 @@ class GraphBuilder(nn.Module):
         ghost_positions = ghost_positions + noise
         
         return ghost_positions
-
-
-def collate_graphs(graphs: List[HeteroData]) -> HeteroData:
-    """
-    Collate multiple HeteroData graphs into a batch.
-    
-    Args:
-        graphs: List of HeteroData objects
-    
-    Returns:
-        Batched HeteroData
-    """
-    from torch_geometric.data import Batch
-    return Batch.from_data_list(graphs)

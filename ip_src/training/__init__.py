@@ -2,12 +2,13 @@
 Training components for Instant Policy.
 """
 
-from ip_src.training.trainer import InstantPolicyTrainer
-from ip_src.training.losses import DiffusionLoss, GripperLoss, CombinedLoss
+from ip_src.training.trainer import InstantPolicyTrainer, EMACallback
+from ip_src.training.losses import FlowLoss, GripperLoss, CombinedLoss
 
 __all__ = [
     "InstantPolicyTrainer",
-    "DiffusionLoss",
+    "EMACallback",
+    "FlowLoss",
     "GripperLoss",
     "CombinedLoss",
 ]

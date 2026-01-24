@@ -96,30 +96,6 @@ def svd_se3_recovery(
     return T
 
 
-def batch_svd_se3_recovery(
-    source_points: torch.Tensor,
-    target_points: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Batch SVD SE(3) recovery.
-    
-    Args:
-        source_points: [B, N, 3] or [horizon, N, 3]
-        target_points: [B, N, 3] or [horizon, N, 3]
-    
-    Returns:
-        SE(3) transforms [B, 4, 4] or [horizon, 4, 4]
-    """
-    B = source_points.shape[0]
-    transforms = []
-    
-    for i in range(B):
-        T = svd_se3_recovery(source_points[i], target_points[i])
-        transforms.append(T)
-    
-    return torch.stack(transforms)
-
-
 class GraphDiffusion(pl.LightningModule):
     """
     GraphDiffusion: In-Context Imitation Learning via Graph Diffusion.
@@ -143,8 +119,8 @@ class GraphDiffusion(pl.LightningModule):
         num_heads: int = 8,
         num_layers: int = 4,
         dropout: float = 0.1,
-        num_points: int = 2048,
-        k_neighbors: int = 16,
+        num_points: int = 16,
+        k_neighbors: int = 8,
         num_gripper_nodes: int = 6,
         prediction_horizon: int = 8,
         num_train_timesteps: int = 1000,
@@ -152,6 +128,8 @@ class GraphDiffusion(pl.LightningModule):
         num_pos_frequencies: int = 10,
         num_edge_frequencies: int = 6,
         freeze_geometry_encoder: bool = True,
+        encoder_checkpoint: Optional[str] = None,
+        encoder_source_prefix: str = "scene_encoder.",
         learning_rate: float = 1e-5,
         weight_decay: float = 0.01,
     ):
@@ -160,20 +138,22 @@ class GraphDiffusion(pl.LightningModule):
         
         Args:
             device: Device to run on
-            hidden_dim: Hidden dimension for transformers
+            hidden_dim: Hidden dimension for transformers (and geometry encoder output)
             edge_dim: Edge feature dimension
             num_heads: Number of attention heads
             num_layers: Number of transformer layers
             dropout: Dropout rate
-            num_points: Points per point cloud
-            k_neighbors: k for k-NN in graph
+            num_points: Number of keypoint nodes M from geometry encoder (default: 16)
+            k_neighbors: k for k-NN in graph (should be < num_points)
             num_gripper_nodes: Gripper nodes per timestep (6)
             prediction_horizon: Future keypoints to predict
             num_train_timesteps: Flow matching training steps
             num_inference_timesteps: Flow matching inference steps
             num_pos_frequencies: Position encoding frequencies
             num_edge_frequencies: Edge encoding frequencies
-            freeze_geometry_encoder: Whether to freeze PointNet++
+            freeze_geometry_encoder: Whether to freeze PointNet++ (recommended: True)
+            encoder_checkpoint: Path to pretrained model.pt for loading encoder weights
+            encoder_source_prefix: Key prefix in checkpoint for encoder (default: "scene_encoder.")
             learning_rate: Learning rate (paper uses 1e-5)
             weight_decay: Weight decay for AdamW
         """
@@ -196,10 +176,24 @@ class GraphDiffusion(pl.LightningModule):
         # === Model Components ===
         
         # 1. Geometry Encoder (frozen PointNet++)
+        # Paper Appendix A: encoder outputs 512-dim features (fixed to match pretrained weights)
         self.geometry_encoder = PointNetPlusPlusEncoder(
-            out_channels=hidden_dim,
             freeze=freeze_geometry_encoder,
         )
+        
+        # Load pretrained encoder weights if checkpoint provided
+        if encoder_checkpoint is not None:
+            print(f"Loading pretrained encoder weights from: {encoder_checkpoint}")
+            self.geometry_encoder.load_pretrained_weights(
+                encoder_checkpoint,
+                source_prefix=encoder_source_prefix,
+                strict=False,
+                verbose=True,
+            )
+        
+        # Projection layer: 512 (encoder output) -> hidden_dim (graph features)
+        # This allows using pretrained encoder with any hidden_dim
+        self.encoder_projection = nn.Linear(512, hidden_dim)
         
         # 2. Graph Builder with edge features
         self.graph_builder = GraphBuilder(
@@ -306,11 +300,13 @@ class GraphDiffusion(pl.LightningModule):
                 grip = demo_grips[d, w]
                 
                 # Encode point cloud with PointNet++
-                point_features = self.geometry_encoder(pcd)
+                # Returns M=16 keypoint features (512-dim) and positions
+                point_features, point_positions = self.geometry_encoder(pcd)
+                point_features = self.encoder_projection(point_features)  # 512 -> hidden_dim
                 
-                # Build local graph
+                # Build local graph using keypoint positions (not raw point cloud)
                 local_graph = self.graph_builder.build_local_graph(
-                    point_cloud=pcd,
+                    point_cloud=point_positions,
                     point_features=point_features,
                     gripper_pose=pose,
                     gripper_state=grip.unsqueeze(0) if grip.dim() == 0 else grip,
@@ -325,9 +321,11 @@ class GraphDiffusion(pl.LightningModule):
             demo_graphs.append(waypoint_graphs)
         
         # === Build Live Graph ===
-        point_features = self.geometry_encoder(live_pcd)
+        # Encode point cloud - returns M=16 keypoint features (512-dim) and positions
+        point_features, point_positions = self.geometry_encoder(live_pcd)
+        point_features = self.encoder_projection(point_features)  # 512 -> hidden_dim
         live_graph = self.graph_builder.build_local_graph(
-            point_cloud=live_pcd,
+            point_cloud=point_positions,
             point_features=point_features,
             gripper_pose=live_pose,
             gripper_state=live_grip.unsqueeze(0) if live_grip.dim() == 0 else live_grip,
@@ -601,12 +599,13 @@ class GraphDiffusion(pl.LightningModule):
                 T_w_e = torch.tensor(demo['T_w_es'][t], dtype=torch.float32, device=device)
                 grip = torch.tensor([demo['grips'][t]], dtype=torch.float32, device=device)
                 
-                # Encode point cloud
-                point_features = self.geometry_encoder(pcd)
+                # Encode point cloud - returns M=16 keypoint features (512-dim) and positions
+                point_features, point_positions = self.geometry_encoder(pcd)
+                point_features = self.encoder_projection(point_features)  # 512 -> hidden_dim
                 
-                # Build local graph
+                # Build local graph using keypoint positions
                 local_graph = self.graph_builder.build_local_graph(
-                    point_cloud=pcd,
+                    point_cloud=point_positions,
                     point_features=point_features,
                     gripper_pose=T_w_e,
                     gripper_state=grip,
@@ -632,12 +631,13 @@ class GraphDiffusion(pl.LightningModule):
         # Store live pose for reference
         live_T_w_e = T_w_e.clone()
         
-        # Encode live point cloud
-        point_features = self.geometry_encoder(pcd)
+        # Encode live point cloud - returns M=16 keypoint features (512-dim) and positions
+        point_features, point_positions = self.geometry_encoder(pcd)
+        point_features = self.encoder_projection(point_features)  # 512 -> hidden_dim
         
-        # Build live local graph
+        # Build live local graph using keypoint positions
         live_graph = self.graph_builder.build_local_graph(
-            point_cloud=pcd,
+            point_cloud=point_positions,
             point_features=point_features,
             gripper_pose=T_w_e,
             gripper_state=grip,
@@ -764,6 +764,31 @@ class GraphDiffusion(pl.LightningModule):
         model = model.to(device)
         model.eval()
         return model
+    
+    def load_encoder_weights(
+        self,
+        checkpoint_path: str,
+        source_prefix: str = "scene_encoder.",
+        strict: bool = False,
+    ):
+        """
+        Load pretrained encoder weights after model initialization.
+        
+        Args:
+            checkpoint_path: Path to model.pt
+            source_prefix: Key prefix in checkpoint
+            strict: Whether to require exact key match
+        
+        Example:
+            model = GraphDiffusion(device="cuda")
+            model.load_encoder_weights("./model.pt")
+        """
+        self.geometry_encoder.load_pretrained_weights(
+            checkpoint_path,
+            source_prefix=source_prefix,
+            strict=strict,
+            verbose=True,
+        )
     
     def save_checkpoint(self, path: str):
         """Save model checkpoint."""

@@ -14,10 +14,9 @@ from ip_src.data.graph_builder import (
     ContextGraph,
     sinusoidal_positional_encoding,
     compute_edge_features,
-    collate_graphs,
 )
 from ip_src.data.pseudo_demo import PseudoDemoGenerator
-from ip_src.data.dataset import InstantPolicyDataset
+from ip_src.data.dataset import InstantPolicyDataset, collate_fn
 
 __all__ = [
     "GraphBuilder",
@@ -25,7 +24,7 @@ __all__ = [
     "ContextGraph",
     "sinusoidal_positional_encoding",
     "compute_edge_features",
-    "collate_graphs",
     "PseudoDemoGenerator",
     "InstantPolicyDataset",
+    "collate_fn",
 ]

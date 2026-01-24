@@ -1,8 +1,8 @@
 """
 Loss Functions for Instant Policy Training.
 
-Implements the loss functions from the paper:
-- Diffusion loss (noise prediction MSE)
+Implements the loss functions for graph-based flow matching:
+- Flow loss (MSE between predicted and target flow vectors)
 - Gripper loss (binary cross-entropy)
 
 Paper: "Instant Policy: In-Context Imitation Learning via Graph Diffusion" (ICLR 2025)
@@ -11,14 +11,15 @@ Paper: "Instant Policy: In-Context Imitation Learning via Graph Diffusion" (ICLR
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 
-class DiffusionLoss(nn.Module):
+class FlowLoss(nn.Module):
     """
-    Diffusion loss for action prediction.
+    Flow matching loss.
     
-    Computes MSE between predicted and actual noise.
+    Computes MSE between predicted and target flow (velocity) vectors.
+    This is used instead of noise prediction in standard diffusion.
     """
     
     def __init__(
@@ -26,13 +27,6 @@ class DiffusionLoss(nn.Module):
         loss_type: str = "mse",
         reduction: str = "mean",
     ):
-        """
-        Initialize diffusion loss.
-        
-        Args:
-            loss_type: Type of loss ("mse", "l1", "huber")
-            reduction: Reduction method ("mean", "sum", "none")
-        """
         super().__init__()
         self.loss_type = loss_type
         self.reduction = reduction
@@ -48,27 +42,28 @@ class DiffusionLoss(nn.Module):
     
     def forward(
         self,
-        noise_pred: torch.Tensor,
-        noise: torch.Tensor,
+        pred_flow: torch.Tensor,
+        target_flow: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Compute diffusion loss.
+        Compute flow loss.
         
         Args:
-            noise_pred: Predicted noise [B, horizon, action_dim]
-            noise: Ground truth noise [B, horizon, action_dim]
-            mask: Optional mask for valid predictions [B, horizon]
+            pred_flow: Predicted flow [B, horizon, 6, 3]
+            target_flow: Target flow [B, horizon, 6, 3]
+            mask: Optional mask [B, horizon]
         
         Returns:
             Loss value
         """
-        loss = self.loss_fn(noise_pred, noise)
+        loss = self.loss_fn(pred_flow, target_flow)
         
         if mask is not None and self.reduction == "none":
-            # Apply mask and reduce
-            loss = loss * mask.unsqueeze(-1)
-            loss = loss.sum() / (mask.sum() * noise.shape[-1] + 1e-8)
+            # Expand mask to match flow dimensions
+            mask = mask.unsqueeze(-1).unsqueeze(-1)  # [B, horizon, 1, 1]
+            loss = loss * mask
+            loss = loss.sum() / (mask.sum() * pred_flow.shape[-2] * pred_flow.shape[-1] + 1e-8)
         
         return loss
 
@@ -85,13 +80,6 @@ class GripperLoss(nn.Module):
         reduction: str = "mean",
         label_smoothing: float = 0.0,
     ):
-        """
-        Initialize gripper loss.
-        
-        Args:
-            reduction: Reduction method
-            label_smoothing: Label smoothing factor
-        """
         super().__init__()
         self.reduction = reduction
         self.label_smoothing = label_smoothing
@@ -106,14 +94,18 @@ class GripperLoss(nn.Module):
         Compute gripper loss.
         
         Args:
-            grip_pred: Predicted gripper logits [B, horizon, 1] or [B, horizon]
+            grip_pred: Predicted gripper logits [B, horizon, ...] 
             grip_target: Target gripper states [B, horizon] (0 or 1)
             mask: Optional mask [B, horizon]
         
         Returns:
             Loss value
         """
-        # Flatten predictions if needed
+        # Flatten extra dimensions if present
+        if grip_pred.dim() > 2:
+            # Average across gripper nodes: [B, horizon, 6, 1] -> [B, horizon]
+            grip_pred = grip_pred.mean(dim=tuple(range(2, grip_pred.dim())))
+        
         if grip_pred.dim() == 3:
             grip_pred = grip_pred.squeeze(-1)
         
@@ -149,119 +141,62 @@ class CombinedLoss(nn.Module):
     """
     Combined loss for Instant Policy training.
     
-    Combines diffusion loss and gripper loss with configurable weights.
+    Combines flow loss and gripper loss with configurable weights.
     """
     
     def __init__(
         self,
-        diffusion_weight: float = 1.0,
+        flow_weight: float = 1.0,
         gripper_weight: float = 0.1,
-        diffusion_loss_type: str = "mse",
+        flow_loss_type: str = "mse",
     ):
-        """
-        Initialize combined loss.
-        
-        Args:
-            diffusion_weight: Weight for diffusion loss
-            gripper_weight: Weight for gripper loss
-            diffusion_loss_type: Type of diffusion loss
-        """
         super().__init__()
-        self.diffusion_weight = diffusion_weight
+        self.flow_weight = flow_weight
         self.gripper_weight = gripper_weight
         
-        self.diffusion_loss = DiffusionLoss(loss_type=diffusion_loss_type)
+        self.flow_loss = FlowLoss(loss_type=flow_loss_type)
         self.gripper_loss = GripperLoss()
     
     def forward(
         self,
-        noise_pred: torch.Tensor,
-        noise: torch.Tensor,
-        grip_pred: torch.Tensor,
-        grip_target: torch.Tensor,
+        pred_flow: torch.Tensor,
+        target_flow: torch.Tensor,
+        pred_grip: torch.Tensor,
+        target_grip: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Compute combined loss.
         
         Args:
-            noise_pred: Predicted noise [B, horizon, action_dim]
-            noise: Ground truth noise [B, horizon, action_dim]
-            grip_pred: Predicted gripper logits [B, horizon, 1]
-            grip_target: Target gripper states [B, horizon]
+            pred_flow: Predicted flow [B, horizon, 6, 3]
+            target_flow: Target flow [B, horizon, 6, 3]
+            pred_grip: Predicted gripper logits [B, horizon, 6, 1]
+            target_grip: Target gripper states [B, horizon]
             mask: Optional mask [B, horizon]
         
         Returns:
             Dictionary with individual and total losses
         """
         # Compute individual losses
-        diff_loss = self.diffusion_loss(noise_pred, noise, mask)
-        grip_loss = self.gripper_loss(grip_pred, grip_target, mask)
+        flow_loss = self.flow_loss(pred_flow, target_flow, mask)
+        
+        grip_loss = torch.tensor(0.0, device=pred_flow.device)
+        if target_grip is not None:
+            grip_loss = self.gripper_loss(pred_grip, target_grip, mask)
         
         # Weighted sum
         total_loss = (
-            self.diffusion_weight * diff_loss +
+            self.flow_weight * flow_loss +
             self.gripper_weight * grip_loss
         )
         
         return {
             'loss': total_loss,
-            'diffusion_loss': diff_loss,
+            'flow_loss': flow_loss,
             'gripper_loss': grip_loss,
         }
 
 
-class ActionLoss(nn.Module):
-    """
-    Direct action prediction loss (for non-diffusion training).
-    
-    Separates translation and rotation components with different weights.
-    """
-    
-    def __init__(
-        self,
-        translation_weight: float = 1.0,
-        rotation_weight: float = 1.0,
-        reduction: str = "mean",
-    ):
-        super().__init__()
-        self.translation_weight = translation_weight
-        self.rotation_weight = rotation_weight
-        self.reduction = reduction
-    
-    def forward(
-        self,
-        action_pred: torch.Tensor,
-        action_target: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Compute action loss.
-        
-        Args:
-            action_pred: Predicted actions [B, horizon, 9]
-            action_target: Target actions [B, horizon, 9]
-        
-        Returns:
-            Dictionary with losses
-        """
-        # Split into translation and rotation
-        trans_pred = action_pred[..., :3]
-        trans_target = action_target[..., :3]
-        
-        rot_pred = action_pred[..., 3:9]
-        rot_target = action_target[..., 3:9]
-        
-        # Compute losses
-        trans_loss = F.mse_loss(trans_pred, trans_target, reduction=self.reduction)
-        rot_loss = F.mse_loss(rot_pred, rot_target, reduction=self.reduction)
-        
-        total_loss = (
-            self.translation_weight * trans_loss +
-            self.rotation_weight * rot_loss
-        )
-        
-        return {
-            'loss': total_loss,
-            'translation_loss': trans_loss,
-            'rotation_loss': rot_loss,
-        }
+# Backward compatibility alias
+DiffusionLoss = FlowLoss

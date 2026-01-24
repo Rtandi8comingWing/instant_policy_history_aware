@@ -1,0 +1,90 @@
+# =============================================================================
+# Instant Policy - .gitignore
+# =============================================================================
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# === Data & Models ===
+# Pseudo-demonstration data (can be very large)
+data/
+!data/.gitkeep
+
+# Model checkpoints and weights
+checkpoints/
+!checkpoints/.gitkeep
+*.ckpt
+*.pt
+*.pth
+!model.pt.example
+
+# === Training Logs ===
+wandb/
+logs/
+lightning_logs/
+outputs/
+runs/
+*.log
+
+# === IDE & Editors ===
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# === Environment ===
+.env
+.venv/
+venv/
+ENV/
+env/
+.python-version
+
+# === Jupyter Notebooks ===
+.ipynb_checkpoints/
+*.ipynb
+
+# === OS Files ===
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# === Testing ===
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# === Misc ===
+*.bak
+*.tmp
+*.temp
+.cache/

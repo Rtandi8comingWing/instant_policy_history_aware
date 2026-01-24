@@ -641,26 +641,3 @@ class ActionDecoder(nn.Module):
         gripper = self.gripper_head(ghost_features)  # [num_ghost, 1]
         
         return flow, gripper
-
-
-class SinusoidalTimestepEmbedding(nn.Module):
-    """Sinusoidal timestep embeddings for diffusion/flow matching."""
-    
-    def __init__(self, dim: int):
-        super().__init__()
-        self.dim = dim
-    
-    def forward(self, timestep: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            timestep: [B] tensor of timesteps
-        Returns:
-            Embeddings [B, dim]
-        """
-        device = timestep.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = timestep.float().unsqueeze(-1) * emb.unsqueeze(0)
-        emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
-        return emb

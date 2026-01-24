@@ -30,8 +30,9 @@ model:
 
 # Graph Construction
 graph:
-  num_points: 2048  # Points per point cloud
-  k_neighbors: 16  # k-NN for point cloud edges
+  num_raw_points: 2048  # Raw points per point cloud (input to geometry encoder)
+  num_keypoints: 16  # Keypoint nodes M from geometry encoder (output)
+  k_neighbors: 8  # k-NN for keypoint graph edges (should be < num_keypoints)
   num_ee_nodes: 6  # End-effector nodes (2 pos + 4 ori)
   num_waypoints: 10  # Waypoints per demonstration
 
@@ -51,7 +52,7 @@ training:
     min_lr: 1.0e-7
   
   # Training parameters
-  batch_size: 32
+  batch_size: 4
   num_epochs: 100
   gradient_clip: 1.0
   

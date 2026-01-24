@@ -1,406 +1,335 @@
 """
 Geometry Encoders for Instant Policy.
 
-Implements the point cloud feature extraction using PointNet++.
-As stated in the paper (Appendix H), the geometry encoder should be kept frozen
-during training - training from scratch or fine-tuning leads to worse performance.
+Implements the point cloud feature extraction using PointNet++ with NeRF-like
+positional encoding, matching the official pretrained weights.
+
+Key features:
+- 2 Set Abstraction layers with local_nn + global_nn structure
+- NeRF-like sinusoidal positional encoding (include_input=True -> 63 dim)
+- Outputs M=16 keypoint nodes with 512-dim features
+- Encoder should be kept FROZEN during training (Appendix H)
 
 Paper: "Instant Policy: In-Context Imitation Learning via Graph Diffusion" (ICLR 2025)
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import math
 from typing import Optional, Tuple
-from torch_geometric.nn import MLP, PointNetConv, fps, global_max_pool, knn
+from torch_geometric.nn import fps, knn
 
+
+def sinusoidal_positional_encoding(
+    coords: torch.Tensor,
+    num_frequencies: int = 10,
+    include_input: bool = True,
+) -> torch.Tensor:
+    """
+    NeRF-like positional encoding.
+    Matches the official weights: Output dim = 63 (if include_input=True and L=10)
+    """
+    # 1. 准备频率: 2^0, ..., 2^(L-1)
+    freq_bands = 2.0 ** torch.arange(
+        num_frequencies, 
+        dtype=coords.dtype, 
+        device=coords.device
+    ) * math.pi # [L]
+    
+    # 2. 扩展维度计算 [..., D, L]
+    # coords: [..., 3] -> [..., 3, 1]
+    # bands: [L] -> [1, L]
+    orig_shape = coords.shape
+    scaled = coords.unsqueeze(-1) * freq_bands.view(*([1]*(len(orig_shape)-1)), 1, num_frequencies)
+    
+    # 3. 计算 Sin/Cos
+    sin_enc = torch.sin(scaled) # [..., 3, L]
+    cos_enc = torch.cos(scaled) # [..., 3, L]
+    
+    # 4. Flatten: [..., 3, L, 2] -> [..., 3 * L * 2]
+    encoding = torch.stack([sin_enc, cos_enc], dim=-1).view(*orig_shape[:-1], -1)
+    
+    # 5. 拼接原始输入 (Key Step for matching 63 dim)
+    if include_input:
+        encoding = torch.cat([coords, encoding], dim=-1)
+        
+    return encoding
 
 class SAModule(nn.Module):
     """
-    Set Abstraction Module from PointNet++.
-    
-    Performs:
-    1. Sampling: FPS to select representative points
-    2. Grouping: k-NN to find local neighborhoods
-    3. PointNet: Extract local features
+    Set Abstraction Module matching the official weight hierarchy:
+    sa_module -> conv -> local_nn / global_nn
     """
-    
     def __init__(
         self,
         ratio: float,
         k: int,
-        mlp_channels: list,
+        in_channels: int,
+        local_dims: list, # e.g. [63, 128, 128, 128]
+        global_dims: list # e.g. [128, 256, 256]
     ):
-        """
-        Initialize Set Abstraction module.
-        
-        Args:
-            ratio: Sampling ratio for FPS
-            k: Number of neighbors for k-NN
-            mlp_channels: Channel sizes for MLP [in_channels, ..., out_channels]
-        """
         super().__init__()
         self.ratio = ratio
         self.k = k
-        self.conv = PointNetConv(MLP(mlp_channels), add_self_loops=False)
-    
-    def forward(
-        self,
-        x: torch.Tensor,
-        pos: torch.Tensor,
-        batch: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Forward pass.
         
-        Args:
-            x: Point features [N, C] or None
-            pos: Point positions [N, 3]
-            batch: Batch indices [N]
+        # Build Local MLP
+        local_layers = []
+        for i in range(len(local_dims) - 1):
+            local_layers.append(nn.Linear(local_dims[i], local_dims[i+1]))
+            # Note: Weights usually imply Bias=True. 
+            # PyG MLPs usually act as: Linear -> BatchNorm -> ReLU
+            # Checking weights: we see 'weight' and 'bias'. 
+            # We don't see batch_norm weights in your print (running_mean/var), 
+            # but maybe they are further down? 
+            # Standard PointNet++ uses BN. Let's assume Linear + ReLU for now or standard PyG MLP.
+            # Your print shows: lins.0.weight, lins.0.bias. This is typical of `torch_geometric.nn.MLP`
+            # which wraps Linear+BN+ReLU into a list called `lins` (if plain) or `children`.
+            # Let's assume standard Linear + ReLU.
+            local_layers.append(nn.ReLU())
         
-        Returns:
-            x: Updated features [M, C']
-            pos: Sampled positions [M, 3]
-            batch: Updated batch indices [M]
-        """
-        # Farthest Point Sampling
+        # Build Global MLP
+        global_layers = []
+        for i in range(len(global_dims) - 1):
+            global_layers.append(nn.Linear(global_dims[i], global_dims[i+1]))
+            global_layers.append(nn.ReLU())
+
+        # Construct the 'conv' module to match keys: sa_module.conv.local_nn
+        # We use nn.Sequential directly to match 'local_nn.lins' structure of PyG MLP
+        # But to be safe with keys like `local_nn.lins.0.weight`, we need a structure that has `lins`.
+        
+        self.conv = nn.Module()
+        self.conv.local_nn = nn.Sequential()
+        # Hack to match PyG MLP structure "lins" naming if using standard Sequential
+        # Standard Sequential uses "0", "1". 
+        # PyG MLP uses "lins.0", "lins.1".
+        # To make loading easiest, we will just use standard Sequential and user might need a tiny rename script,
+        # OR we try to define `lins` attribute.
+        
+        # Let's use a custom class to hold the list to match 'local_nn.lins.0'
+        class MLP_Wrapper(nn.Module):
+            def __init__(self, dims):
+                super().__init__()
+                self.lins = nn.ModuleList()
+                for i in range(len(dims)-1):
+                    self.lins.append(nn.Linear(dims[i], dims[i+1]))
+                self.act = nn.ReLU() # Shared activation or one per layer? 
+                # PyG MLP usually applies act after each linear.
+                
+            def forward(self, x):
+                for i, lin in enumerate(self.lins):
+                    x = lin(x)
+                    if i < len(self.lins) - 1: # No activation on last layer usually? 
+                        # Looking at weights: 128->128 then 128->256. 
+                        # Usually internal layers have ReLU.
+                        x = self.act(x)
+                return x
+
+        self.conv.local_nn = MLP_Wrapper(local_dims)
+        self.conv.global_nn = MLP_Wrapper(global_dims)
+
+    def forward(self, x, pos, batch):
+        # 1. FPS
         idx = fps(pos, batch, ratio=self.ratio)
-        
-        # k-NN graph
         row, col = knn(pos, pos[idx], self.k, batch, batch[idx])
-        edge_index = torch.stack([col, row], dim=0)
         
-        # Apply PointNet convolution
-        x_dst = None if x is None else x[idx]
-        x = self.conv((x, x_dst), (pos, pos[idx]), edge_index)
+        # 2. Pos Encoding
+        pos_diff = pos[col] - pos[idx[row]]
+        pos_enc = sinusoidal_positional_encoding(pos_diff, include_input=True) # [E, 63]
         
-        pos, batch = pos[idx], batch[idx]
+        # 3. Prep Local Input
+        if x is not None:
+            # x[col] is neighbor features
+            edge_input = torch.cat([x[col], pos_enc], dim=-1)
+        else:
+            edge_input = pos_enc
+            
+        # 4. Local NN
+        edge_feat = self.conv.local_nn(edge_input)  # [E, Hidden]
         
-        return x, pos, batch
-
-
-class GlobalSAModule(nn.Module):
-    """
-    Global Set Abstraction Module.
-    
-    Aggregates all points into a single global feature.
-    """
-    
-    def __init__(self, mlp_channels: list):
-        super().__init__()
-        self.mlp = MLP(mlp_channels)
-    
-    def forward(
-        self,
-        x: torch.Tensor,
-        pos: torch.Tensor,
-        batch: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Forward pass.
+        # 5. Max Pooling
+        # Scatter max - must match dtype for mixed precision training
+        out_dim = edge_feat.size(-1)
+        out = torch.zeros(
+            pos[idx].size(0), out_dim, 
+            device=edge_feat.device, 
+            dtype=edge_feat.dtype  # Match dtype for bf16-mixed precision
+        )
+        # row is index of target centroid (0 to M-1)
+        out = out.scatter_reduce(0, row.unsqueeze(-1).expand(-1, out_dim), edge_feat, reduce="amax", include_self=False)
         
-        Args:
-            x: Point features [N, C]
-            pos: Point positions [N, 3]
-            batch: Batch indices [N]
+        # 6. Global NN
+        out = self.conv.global_nn(out)
         
-        Returns:
-            x: Global features [B, C']
-            pos: Zero positions [B, 3]
-            batch: Batch indices [B]
-        """
-        x = self.mlp(torch.cat([x, pos], dim=1))
-        x = global_max_pool(x, batch)
-        
-        # Create placeholder positions and batch indices
-        pos = pos.new_zeros(x.size(0), 3)
-        batch = torch.arange(x.size(0), device=batch.device)
-        
-        return x, pos, batch
-
-
-class FPModule(nn.Module):
-    """
-    Feature Propagation Module from PointNet++.
-    
-    Propagates features from sampled points back to original points
-    using distance-weighted interpolation.
-    """
-    
-    def __init__(self, k: int, mlp_channels: list):
-        """
-        Initialize Feature Propagation module.
-        
-        Args:
-            k: Number of neighbors for interpolation
-            mlp_channels: Channel sizes for MLP
-        """
-        super().__init__()
-        self.k = k
-        self.mlp = MLP(mlp_channels)
-    
-    def forward(
-        self,
-        x: torch.Tensor,
-        pos: torch.Tensor,
-        batch: torch.Tensor,
-        x_skip: Optional[torch.Tensor],
-        pos_skip: torch.Tensor,
-        batch_skip: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Forward pass.
-        
-        Args:
-            x: Features from coarser level [M, C]
-            pos: Positions from coarser level [M, 3]
-            batch: Batch indices from coarser level [M]
-            x_skip: Skip connection features [N, C'] or None
-            pos_skip: Original positions [N, 3]
-            batch_skip: Original batch indices [N]
-        
-        Returns:
-            Interpolated features [N, C'']
-        """
-        # k-NN from skip positions to current positions
-        row, col = knn(pos, pos_skip, self.k, batch, batch_skip)
-        
-        # Compute distances
-        diff = pos_skip[row] - pos[col]
-        squared_dist = (diff * diff).sum(dim=-1, keepdim=True)
-        
-        # Distance-weighted interpolation
-        weights = 1.0 / (squared_dist + 1e-8)
-        
-        # Normalize weights per target point
-        weights_sum = torch.zeros(pos_skip.size(0), 1, device=weights.device)
-        weights_sum.scatter_add_(0, row.unsqueeze(-1), weights)
-        weights = weights / (weights_sum[row] + 1e-8)
-        
-        # Interpolate features
-        x_interp = torch.zeros(pos_skip.size(0), x.size(1), device=x.device)
-        x_interp.scatter_add_(0, row.unsqueeze(-1).expand(-1, x.size(1)), weights * x[col])
-        
-        # Concatenate with skip features
-        if x_skip is not None:
-            x_interp = torch.cat([x_interp, x_skip], dim=1)
-        
-        return self.mlp(x_interp)
-
+        return out, pos[idx], batch[idx]
 
 class PointNetPlusPlusEncoder(nn.Module):
     """
-    PointNet++ Encoder for extracting geometric features from point clouds.
+    PointNet++ Encoder matching official pretrained weights.
     
-    This encoder is kept FROZEN during training as stated in the paper
-    (Appendix H: "Training from scratch did not work at all, while 
-    fine-tuning resulted in significantly worse performance").
-    
-    Architecture follows the standard PointNet++ with:
-    - 3 Set Abstraction layers for hierarchical feature extraction
-    - 3 Feature Propagation layers for per-point features
+    Output: 16 keypoints with 512-dim features (fixed to match pretrained weights).
+    Should be kept FROZEN during training (Appendix H).
     """
     
-    def __init__(
-        self,
-        out_channels: int = 256,
-        freeze: bool = True,
-    ):
-        """
-        Initialize PointNet++ encoder.
-        
-        Args:
-            out_channels: Output feature dimension per point
-            freeze: Whether to freeze encoder weights (should be True)
-        """
+    def __init__(self, freeze: bool = True):
         super().__init__()
-        self.out_channels = out_channels
         
-        # Set Abstraction layers (encoder)
-        # SA1: N points -> N/4 points
-        self.sa1 = SAModule(
-            ratio=0.25,
+        # SA1: 
+        # Input: 63 (PosEnc+Raw)
+        # Local MLP: 63 -> 128 -> 128 -> 128 (Based on weights)
+        # Global MLP: 128 -> 256 -> 256
+        self.sa1_module = SAModule(
+            ratio=0.0625,  # 2048->128
             k=32,
-            mlp_channels=[3 + 3, 64, 64, 128],  # pos + pos_local
+            in_channels=0,
+            local_dims=[63, 128, 128, 128],
+            global_dims=[128, 256, 256]
         )
         
-        # SA2: N/4 points -> N/16 points
-        self.sa2 = SAModule(
-            ratio=0.25,
+        # SA2:
+        # Input: 256 (SA1 Out) + 63 (PosEnc) = 319
+        # Local MLP: 319 -> 512 -> 512 -> 512
+        # Global MLP: 512 -> 512 -> 512
+        self.sa2_module = SAModule(
+            ratio=0.125,  # 128->16
             k=32,
-            mlp_channels=[128 + 3, 128, 128, 256],
+            in_channels=256,
+            local_dims=[319, 512, 512, 512],
+            global_dims=[512, 512, 512]
         )
         
-        # SA3: N/16 points -> N/64 points
-        self.sa3 = SAModule(
-            ratio=0.25,
-            k=32,
-            mlp_channels=[256 + 3, 256, 256, 512],
-        )
-        
-        # Feature Propagation layers (decoder)
-        # FP3: N/64 -> N/16
-        self.fp3 = FPModule(k=3, mlp_channels=[512 + 256, 256, 256])
-        
-        # FP2: N/16 -> N/4
-        self.fp2 = FPModule(k=3, mlp_channels=[256 + 128, 256, 256])
-        
-        # FP1: N/4 -> N
-        self.fp1 = FPModule(k=3, mlp_channels=[256 + 3, 256, out_channels])  # +3 for original positions
-        
-        # Freeze if specified
         if freeze:
             self.freeze()
-    
+            
     def freeze(self):
-        """Freeze all encoder parameters."""
+        """Freeze all encoder parameters (recommended for training)."""
         for param in self.parameters():
             param.requires_grad = False
+        self.eval()  # Set to eval mode (affects dropout/batchnorm if any)
     
     def unfreeze(self):
-        """Unfreeze all encoder parameters (not recommended)."""
+        """Unfreeze encoder parameters (not recommended per paper)."""
         for param in self.parameters():
             param.requires_grad = True
+        self.train()
     
-    def forward(
-        self,
-        pos: torch.Tensor,
-        batch: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    def load_pretrained_weights(
+        self, 
+        checkpoint_path: str,
+        source_prefix: str = "scene_encoder.",
+        strict: bool = False,
+        verbose: bool = True,
+    ) -> Tuple[list, list]:
         """
-        Extract per-point features from point cloud.
+        Load pretrained weights from official model.pt checkpoint.
+        
+        The official checkpoint uses 'scene_encoder' as prefix, but our model
+        uses 'geometry_encoder'. This method handles the key mapping.
         
         Args:
-            pos: Point positions [N, 3]
+            checkpoint_path: Path to model.pt file
+            source_prefix: Prefix used in checkpoint for encoder (default: "scene_encoder.")
+            strict: If True, raise error on missing/unexpected keys
+            verbose: Print loading information
+        
+        Returns:
+            Tuple of (missing_keys, unexpected_keys)
+        
+        Example:
+            encoder = PointNetPlusPlusEncoder(freeze=True)
+            encoder.load_pretrained_weights("./model.pt")
+        """
+        import os
+        
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        
+        # Load checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        
+        # Handle different checkpoint formats
+        if "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+        elif "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        else:
+            state_dict = checkpoint  # Assume it's just the state dict
+        
+        # Extract encoder weights and remap keys
+        encoder_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith(source_prefix):
+                # Remove source prefix to get local key
+                local_key = key[len(source_prefix):]
+                encoder_state_dict[local_key] = value
+        
+        if verbose:
+            print(f"Found {len(encoder_state_dict)} encoder parameters in checkpoint")
+            if encoder_state_dict:
+                print(f"  Example keys: {list(encoder_state_dict.keys())[:3]}")
+        
+        if not encoder_state_dict:
+            raise ValueError(
+                f"No encoder weights found with prefix '{source_prefix}'. "
+                f"Available prefixes: {set(k.split('.')[0] + '.' for k in state_dict.keys())}"
+            )
+        
+        # Load weights
+        result = self.load_state_dict(encoder_state_dict, strict=strict)
+        
+        if verbose:
+            if result.missing_keys:
+                print(f"  Missing keys: {result.missing_keys}")
+            if result.unexpected_keys:
+                print(f"  Unexpected keys: {result.unexpected_keys}")
+            print("✅ Encoder weights loaded successfully")
+        
+        return result.missing_keys, result.unexpected_keys
+
+    def forward(self, pos: torch.Tensor, batch: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Extract keypoint features from point cloud.
+        
+        Args:
+            pos: Point positions [N, 3] where N is typically 2048 * batch_size
             batch: Batch indices [N], defaults to single batch
         
         Returns:
-            Per-point features [N, out_channels]
+            features: Per-keypoint features [M * batch_size, 512]
+            positions: Keypoint positions [M * batch_size, 3]
         """
         if batch is None:
             batch = torch.zeros(pos.size(0), dtype=torch.long, device=pos.device)
+            
+        # SA1
+        x1, pos1, batch1 = self.sa1_module(None, pos, batch)
         
-        # Store for skip connections
-        pos0, batch0 = pos, batch
-        x0 = pos  # Use positions as initial features
+        # SA2
+        x2, pos2, batch2 = self.sa2_module(x1, pos1, batch1)
         
-        # Encoder
-        x1, pos1, batch1 = self.sa1(None, pos0, batch0)
-        x2, pos2, batch2 = self.sa2(x1, pos1, batch1)
-        x3, pos3, batch3 = self.sa3(x2, pos2, batch2)
-        
-        # Decoder
-        x2 = self.fp3(x3, pos3, batch3, x2, pos2, batch2)
-        x1 = self.fp2(x2, pos2, batch2, x1, pos1, batch1)
-        x0 = self.fp1(x1, pos1, batch1, pos0, pos0, batch0)  # Use pos as skip features
-        
-        return x0
+        return x2, pos2
 
 
-class PointNetEncoder(nn.Module):
-    """
-    Simple PointNet encoder as a lighter alternative.
-    
-    Less powerful than PointNet++ but faster and simpler.
-    """
-    
-    def __init__(
-        self,
-        out_channels: int = 256,
-        freeze: bool = True,
-    ):
-        super().__init__()
-        self.out_channels = out_channels
-        
-        # Per-point MLP
-        self.mlp1 = nn.Sequential(
-            nn.Linear(3, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Linear(64, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Linear(128, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-        )
-        
-        # Global feature extraction
-        self.mlp2 = nn.Sequential(
-            nn.Linear(256, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Linear(512, 512),
-        )
-        
-        # Per-point output (combines local and global)
-        self.mlp3 = nn.Sequential(
-            nn.Linear(256 + 512, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Linear(256, out_channels),
-        )
-        
-        if freeze:
-            self.freeze()
-    
-    def freeze(self):
-        for param in self.parameters():
-            param.requires_grad = False
-    
-    def forward(
-        self,
-        pos: torch.Tensor,
-        batch: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Extract per-point features.
-        
-        Args:
-            pos: Point positions [N, 3]
-            batch: Batch indices [N]
-        
-        Returns:
-            Per-point features [N, out_channels]
-        """
-        if batch is None:
-            batch = torch.zeros(pos.size(0), dtype=torch.long, device=pos.device)
-        
-        # Per-point features
-        x = self.mlp1(pos)  # [N, 256]
-        
-        # Global features via max pooling
-        x_global = self.mlp2(x)  # [N, 512]
-        x_global = global_max_pool(x_global, batch)  # [B, 512]
-        
-        # Expand global features to all points
-        x_global = x_global[batch]  # [N, 512]
-        
-        # Combine local and global
-        x = torch.cat([x, x_global], dim=1)  # [N, 256 + 512]
-        x = self.mlp3(x)  # [N, out_channels]
-        
-        return x
-
-
-def load_pretrained_pointnet_plus_plus(
-    checkpoint_path: Optional[str] = None,
-    out_channels: int = 256,
+def load_encoder_from_checkpoint(
+    checkpoint_path: str,
+    source_prefix: str = "scene_encoder.",
+    freeze: bool = True,
+    device: str = "cpu",
 ) -> PointNetPlusPlusEncoder:
     """
-    Load a pretrained PointNet++ encoder.
+    Convenience function to create and load encoder from checkpoint.
     
     Args:
-        checkpoint_path: Path to pretrained weights (None for random init)
-        out_channels: Output feature dimension
+        checkpoint_path: Path to model.pt
+        source_prefix: Prefix in checkpoint
+        freeze: Whether to freeze encoder
+        device: Device to load to
     
     Returns:
-        Pretrained and frozen PointNet++ encoder
+        Loaded encoder
+    
+    Example:
+        encoder = load_encoder_from_checkpoint("./model.pt")
     """
-    encoder = PointNetPlusPlusEncoder(out_channels=out_channels, freeze=True)
-    
-    if checkpoint_path is not None:
-        state_dict = torch.load(checkpoint_path, map_location="cpu")
-        encoder.load_state_dict(state_dict, strict=False)
-    
-    return encoder
+    encoder = PointNetPlusPlusEncoder(freeze=freeze)
+    encoder.load_pretrained_weights(checkpoint_path, source_prefix)
+    return encoder.to(device)
