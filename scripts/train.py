@@ -83,7 +83,7 @@ def main():
         dataset = InstantPolicyDataset(
             data_dir=args.data_dir,
             num_points=graph_config.get("num_raw_points", 2048),  # Raw point cloud size
-            num_waypoints=graph_config.get("num_waypoints", 10),
+            context_len=graph_config.get("num_waypoints", 10),    # L=10 per Appendix E
             num_demos=config["data"]["pseudo_demo"]["num_demos_per_task"],
             prediction_horizon=model_config.get("action", {}).get("prediction_horizon", 8),
         )
@@ -92,6 +92,8 @@ def main():
         print(f"Error loading dataset: {e}")
         print("\nPlease generate pseudo-demonstrations first:")
         print("  python scripts/generate_pseudo_demos.py --output_dir ./data/pseudo_demos --num_tasks 1000")
+        print("Or generate ShapeNet-based demonstrations:")
+        print("  python scripts/generate_shapenet_demos.py --shapenet_root ./data/shapenet --output_dir ./data/shapenet_demos --num_tasks 1000")
         return
     
     # Split into train/val

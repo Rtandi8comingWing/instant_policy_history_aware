@@ -4,15 +4,16 @@ GraphDiffusion - Main model for Instant Policy.
 This module implements the complete Instant Policy model following the paper:
 - Graph-based representation with edge features
 - Three-stage network (σ, φ, ψ) with edge-aware attention
-- Flow matching for geometric action generation
+- Flow matching for geometric action generation in SE(3) space
 - Ghost gripper nodes as action hypotheses
 
-Key differences from standard Diffusion Policy:
+Key implementation details (following Appendix B):
 1. Uses GRAPH structure throughout (not pooled features)
 2. Edge features participate in attention (Equation 3)
-3. Outputs geometric flow vectors (not flat noise)
-4. Ghost gripper nodes represent future keypoints
-5. SVD (Arun's Method) for SE(3) recovery from point displacements
+3. Noise is added in se(3) (tangent space), NOT Euclidean coordinates
+4. Logmap/Expmap for SE(3) <-> se(3) conversion
+5. Normalization to [-1, 1] with 1cm translation and 3° rotation scales
+6. SVD (Arun's Method) for SE(3) recovery from point displacements
 
 Compatible with the original instant_policy.pyi interface.
 
@@ -38,6 +39,15 @@ from ip_src.models.diffusion import (
     FlowMatchingConfig,
 )
 from ip_src.data.graph_builder import GraphBuilder, LocalGraph, ContextGraph
+from ip_src.utils.se3_utils import (
+    se3_log_map,
+    se3_exp_map,
+    SE3ActionNormalizer,
+    compute_relative_transform,
+    apply_transform_to_points,
+    poses_to_gripper_positions,
+    DEFAULT_GRIPPER_OFFSETS,
+)
 
 
 def svd_se3_recovery(
@@ -241,6 +251,16 @@ class GraphDiffusion(pl.LightningModule):
             num_inference_timesteps=num_inference_timesteps,
         )
         self.flow_scheduler = FlowMatchingScheduler(flow_config)
+        
+        # 7. SE(3) Action Normalizer (Appendix B & E)
+        # Translation scale: 1cm, Rotation scale: 3 degrees ≈ 0.0524 radians
+        self.action_normalizer = SE3ActionNormalizer(
+            trans_scale=0.01,  # 1cm
+            rot_scale=0.0524,  # ~3 degrees
+        )
+        
+        # Register gripper offsets as buffer
+        self.register_buffer("gripper_offsets", DEFAULT_GRIPPER_OFFSETS)
     
     def set_num_demos(self, num_demos: int) -> None:
         """Set number of demonstrations to use."""
@@ -344,34 +364,43 @@ class GraphDiffusion(pl.LightningModule):
         live_pcd: torch.Tensor,
         live_pose: torch.Tensor,
         live_grip: torch.Tensor,
-        target_positions: torch.Tensor,
+        target_poses: torch.Tensor,
+        target_positions: Optional[torch.Tensor] = None,
         target_grips: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Training forward pass with proper graph-based processing.
+        Training forward pass with SE(3) flow matching (Appendix B).
         
-        Uses flow matching: predicts the flow (velocity) pointing from
-        noisy positions toward target positions.
+        Following the paper's noise addition procedure:
+        1. Compute ground truth action T_EA = T_WE^{-1} @ T_WA (relative SE(3))
+        2. Project to se(3) via Logmap
+        3. Normalize to [-1, 1] using action_scale (1cm trans, 3° rot)
+        4. Add flow matching noise in normalized se(3) space
+        5. Unnormalize and project back to SE(3) via Expmap
+        6. Apply noisy action to live gripper to get noisy ghost positions
+        7. Predict flow in normalized se(3) space
         
         Args:
             demo_pcds: Demo point clouds [B, num_demos, num_wp, num_points, 3]
             demo_poses: Demo poses [B, num_demos, num_wp, 4, 4]
             demo_grips: Demo gripper states [B, num_demos, num_wp]
             live_pcd: Live point cloud [B, num_points, 3]
-            live_pose: Live pose [B, 4, 4]
+            live_pose: Live pose [B, 4, 4] (T_WE - current end-effector pose)
             live_grip: Live gripper state [B]
-            target_positions: Target ghost positions [B, horizon, 6, 3]
+            target_poses: Target poses [B, horizon, 4, 4] (T_WA - target poses)
+            target_positions: Target ghost positions [B, horizon, 6, 3] (optional, for logging)
             target_grips: Target gripper states [B, horizon] (optional)
         
         Returns:
             Dictionary with loss components
         """
         B = live_pcd.shape[0]
+        H = target_poses.shape[1]  # horizon
         device = live_pcd.device
         
         # Process each sample and collect context graphs for batching
         all_context_graphs = []
-        all_target_velocities = []
+        all_target_flows = []  # Target flow in normalized se(3) space
         all_timesteps = []
         
         for b in range(B):
@@ -389,26 +418,61 @@ class GraphDiffusion(pl.LightningModule):
             t = torch.rand(1, device=device)
             all_timesteps.append(t)
             
-            # Get target positions for this sample
-            target_pos = target_positions[b]  # [horizon, 6, 3]
+            # === Step A: Compute Ground Truth SE(3) Actions ===
+            # T_EA = T_WE^{-1} @ T_WA for each horizon step
+            live_T_WE = live_pose[b]  # [4, 4]
+            target_T_WAs = target_poses[b]  # [horizon, 4, 4]
             
-            # Sample noise (random starting positions)
-            noise = torch.randn_like(target_pos)
+            # For each horizon step, compute relative action from current pose
+            # Note: We compute action relative to LIVE pose, not previous step
+            gt_actions_se3 = []  # [horizon, 4, 4]
+            for h in range(H):
+                T_WA = target_T_WAs[h]
+                T_EA = compute_relative_transform(T_WA.unsqueeze(0), live_T_WE.unsqueeze(0)).squeeze(0)
+                gt_actions_se3.append(T_EA)
+            gt_actions_se3 = torch.stack(gt_actions_se3)  # [horizon, 4, 4]
             
-            # Interpolate: x_t = (1-t)*target + t*noise
-            # At t=0, x_t = target; at t=1, x_t = noise
-            noisy_pos = self.flow_scheduler.interpolate(target_pos, noise, t)
+            # === Step B: Project to se(3) via Logmap ===
+            gt_xi = se3_log_map(gt_actions_se3)  # [horizon, 6]
             
-            # Target velocity (flow): v = noise - target (points from target to noise)
-            # During inference we integrate backwards, so we predict -v
-            target_velocity = self.flow_scheduler.get_velocity(target_pos, noise, t)
-            all_target_velocities.append(target_velocity)
+            # === Step C: Normalize to [-1, 1] ===
+            gt_xi_norm = self.action_normalizer.normalize(gt_xi)  # [horizon, 6]
             
-            # Build context graph with noisy ghost positions
+            # === Step D: Flow Matching Noise in Normalized se(3) Space ===
+            # Sample noise in normalized space (standard Gaussian)
+            noise_xi_norm = torch.randn_like(gt_xi_norm)  # [horizon, 6]
+            
+            # Interpolate: xi_t = (1-t)*gt_xi_norm + t*noise_xi_norm
+            noisy_xi_norm = self.flow_scheduler.interpolate(gt_xi_norm, noise_xi_norm, t)
+            
+            # Target velocity (flow): v = noise - target
+            target_flow = self.flow_scheduler.get_velocity(gt_xi_norm, noise_xi_norm, t)
+            all_target_flows.append(target_flow)  # [horizon, 6]
+            
+            # === Step E: Unnormalize and Expmap to SE(3) ===
+            noisy_xi = self.action_normalizer.unnormalize(noisy_xi_norm)  # [horizon, 6]
+            noisy_actions_se3 = se3_exp_map(noisy_xi)  # [horizon, 4, 4]
+            
+            # === Step F: Apply Noisy Actions to Live Gripper ===
+            # Get live gripper positions
+            live_gripper_pos = live_graph.data['gripper'].pos  # [6, 3]
+            
+            # Apply each noisy action to live gripper
+            noisy_ghost_positions = []
+            for h in range(H):
+                # Transform live gripper points by noisy action
+                transformed = apply_transform_to_points(
+                    live_gripper_pos.unsqueeze(0),  # [1, 6, 3]
+                    noisy_actions_se3[h].unsqueeze(0),  # [1, 4, 4]
+                ).squeeze(0)  # [6, 3]
+                noisy_ghost_positions.append(transformed)
+            noisy_ghost_positions = torch.stack(noisy_ghost_positions)  # [horizon, 6, 3]
+            
+            # === Step G: Build Context Graph with Noisy Ghost Positions ===
             context_graph = self.graph_builder.build_context_graph(
                 demo_graphs=demo_graphs,
                 live_graph=live_graph,
-                noisy_ghost_positions=noisy_pos,
+                noisy_ghost_positions=noisy_ghost_positions,
                 diffusion_timestep=t,
             )
             
@@ -426,20 +490,17 @@ class GraphDiffusion(pl.LightningModule):
             batched_graph[node_type].x = features
         
         # === Predict flow with ψ(·) ===
+        # Output: 6D flow per ghost node (3 trans + 3 rot in normalized se(3))
         x_dict, edge_index_dict, edge_attr_dict = self._extract_graph_data(batched_graph)
         pred_flow, grip_pred = self.action_decoder(x_dict, edge_index_dict, edge_attr_dict)
         
         # === Unbatch predictions ===
-        # Each sample has (horizon * num_gripper_nodes) ghost nodes
         num_ghost_per_sample = self.prediction_horizon * self.num_gripper_nodes
         
         pred_flows = []
         grip_preds = []
         
-        # Handle batch dimension from PyG
-        # Ghost nodes are batched - we need to split them per sample
         if 'ghost' in batched_graph.node_types:
-            # Get batch indices for ghost nodes
             ghost_batch = batched_graph['ghost'].batch
             
             for b in range(B):
@@ -458,7 +519,6 @@ class GraphDiffusion(pl.LightningModule):
                 pred_flows.append(sample_flow)
                 grip_preds.append(sample_grip)
         else:
-            # Fallback: split by expected size
             for b in range(B):
                 start_idx = b * num_ghost_per_sample
                 end_idx = start_idx + num_ghost_per_sample
@@ -479,20 +539,25 @@ class GraphDiffusion(pl.LightningModule):
         # Stack batch
         pred_flows = torch.stack(pred_flows)  # [B, horizon, 6, 6]
         grip_preds = torch.stack(grip_preds)  # [B, horizon, 6, 1]
-        target_velocities = torch.stack(all_target_velocities)  # [B, horizon, 6, 3]
+        target_flows = torch.stack(all_target_flows)  # [B, horizon, 6]
         
-        # Extract translation flow (first 3 dims)
-        pred_trans_flow = pred_flows[..., :3]  # [B, horizon, 6, 3]
+        # Average flow prediction across 6 gripper nodes
+        # Each node predicts the same SE(3) flow, so we average
+        pred_flow_avg = pred_flows.mean(dim=2)  # [B, horizon, 6]
         
         return {
-            'pred_flow': pred_trans_flow,
-            'target_flow': target_velocities,
+            'pred_flow': pred_flow_avg,  # [B, horizon, 6] - normalized se(3) flow
+            'target_flow': target_flows,  # [B, horizon, 6] - normalized se(3) flow
             'pred_grip': grip_preds,
             'target_grip': target_grips,
         }
     
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        """PyTorch Lightning training step."""
+        """
+        PyTorch Lightning training step.
+        
+        Loss is computed in normalized se(3) space (6D flow vectors).
+        """
         outputs = self.forward(
             demo_pcds=batch['demo_pcds'],
             demo_poses=batch['demo_poses'],
@@ -500,12 +565,18 @@ class GraphDiffusion(pl.LightningModule):
             live_pcd=batch['live_pcd'],
             live_pose=batch['live_pose'],
             live_grip=batch['live_grip'],
-            target_positions=batch['target_positions'],
+            target_poses=batch['target_poses'],
+            target_positions=batch.get('target_positions'),
             target_grips=batch.get('target_grips'),
         )
         
-        # Flow matching loss (MSE between predicted and target flow)
+        # Flow matching loss in normalized se(3) space
+        # Both pred_flow and target_flow are [B, horizon, 6]
         flow_loss = F.mse_loss(outputs['pred_flow'], outputs['target_flow'])
+        
+        # Split into translation and rotation components for logging
+        trans_loss = F.mse_loss(outputs['pred_flow'][..., :3], outputs['target_flow'][..., :3])
+        rot_loss = F.mse_loss(outputs['pred_flow'][..., 3:], outputs['target_flow'][..., 3:])
         
         # Gripper prediction loss (BCE)
         if outputs['target_grip'] is not None:
@@ -521,6 +592,8 @@ class GraphDiffusion(pl.LightningModule):
         
         # Logging
         self.log('train/flow_loss', flow_loss, prog_bar=True)
+        self.log('train/trans_loss', trans_loss)
+        self.log('train/rot_loss', rot_loss)
         self.log('train/grip_loss', grip_loss)
         self.log('train/total_loss', loss, prog_bar=True)
         
@@ -535,12 +608,18 @@ class GraphDiffusion(pl.LightningModule):
             live_pcd=batch['live_pcd'],
             live_pose=batch['live_pose'],
             live_grip=batch['live_grip'],
-            target_positions=batch['target_positions'],
+            target_poses=batch['target_poses'],
+            target_positions=batch.get('target_positions'),
             target_grips=batch.get('target_grips'),
         )
         
         flow_loss = F.mse_loss(outputs['pred_flow'], outputs['target_flow'])
+        trans_loss = F.mse_loss(outputs['pred_flow'][..., :3], outputs['target_flow'][..., :3])
+        rot_loss = F.mse_loss(outputs['pred_flow'][..., 3:], outputs['target_flow'][..., 3:])
+        
         self.log('val/flow_loss', flow_loss, prog_bar=True)
+        self.log('val/trans_loss', trans_loss)
+        self.log('val/rot_loss', rot_loss)
         
         return flow_loss
     
@@ -572,8 +651,10 @@ class GraphDiffusion(pl.LightningModule):
         """
         Predict actions given demonstrations and current observation.
         
-        Uses iterative flow matching and SVD (Arun's Method) to recover
-        SE(3) transformations from predicted point displacements.
+        Uses iterative flow matching in SE(3) tangent space (se(3)):
+        1. Initialize with noise in normalized se(3) space
+        2. Iteratively denoise using predicted flow
+        3. Convert final se(3) actions to SE(3) matrices via Expmap
         
         Compatible with original instant_policy.pyi interface.
         
@@ -583,7 +664,7 @@ class GraphDiffusion(pl.LightningModule):
                 - 'live': Current observation dictionary
         
         Returns:
-            actions: Predicted transforms [horizon, 4, 4]
+            actions: Predicted transforms [horizon, 4, 4] (T_EA - action in EE frame)
             grips: Predicted gripper states [horizon, 1]
         """
         self.eval()
@@ -629,7 +710,7 @@ class GraphDiffusion(pl.LightningModule):
         grip = torch.tensor([live_obs['grips'][0]], dtype=torch.float32, device=device)
         
         # Store live pose for reference
-        live_T_w_e = T_w_e.clone()
+        live_T_WE = T_w_e.clone()  # [4, 4]
         
         # Encode live point cloud - returns M=16 keypoint features (512-dim) and positions
         point_features, point_positions = self.geometry_encoder(pcd)
@@ -651,22 +732,33 @@ class GraphDiffusion(pl.LightningModule):
         # Get live gripper positions for reference
         live_gripper_pos = live_graph.data['gripper'].pos.clone()  # [6, 3]
         
-        # === Initialize Ghost Positions (from noise) ===
-        ghost_positions = self.graph_builder.create_initial_ghost_positions(
-            live_gripper_pos,
-            self.prediction_horizon,
-        )  # [horizon, 6, 3]
+        # === Initialize SE(3) Actions from Noise ===
+        # Start with random normalized se(3) vectors (like Gaussian noise)
+        current_xi_norm = torch.randn(
+            self.prediction_horizon, 6, device=device
+        )  # [horizon, 6]
         
-        # Store positions at each step for incremental SE(3) recovery
-        position_history = [ghost_positions.clone()]
-        
-        # === Iterative Flow Matching ===
+        # === Iterative Flow Matching Denoising ===
         timesteps = self.flow_scheduler.inference_timesteps
         step_sizes = self.flow_scheduler.step_sizes
         
         gripper_preds = []
         
         for i, (t, dt) in enumerate(zip(timesteps, step_sizes)):
+            # Convert current normalized se(3) to SE(3) actions
+            current_xi = self.action_normalizer.unnormalize(current_xi_norm)  # [horizon, 6]
+            current_actions_se3 = se3_exp_map(current_xi)  # [horizon, 4, 4]
+            
+            # Apply current noisy actions to live gripper to get ghost positions
+            ghost_positions = []
+            for h in range(self.prediction_horizon):
+                transformed = apply_transform_to_points(
+                    live_gripper_pos.unsqueeze(0),  # [1, 6, 3]
+                    current_actions_se3[h].unsqueeze(0),  # [1, 4, 4]
+                ).squeeze(0)  # [6, 3]
+                ghost_positions.append(transformed)
+            ghost_positions = torch.stack(ghost_positions)  # [horizon, 6, 3]
+            
             # Build context graph with current ghost positions
             context_graph = self.graph_builder.build_context_graph(
                 demo_graphs=demo_graphs,
@@ -684,40 +776,28 @@ class GraphDiffusion(pl.LightningModule):
                 context_graph.data[node_type].x = features
             
             # Predict flow with ψ(·)
+            # Output: [num_ghost, 6] - 6D flow in normalized se(3) space
             x_dict, edge_index_dict, edge_attr_dict = self._extract_graph_data(context_graph.data)
             flow, grip_pred = self.action_decoder(x_dict, edge_index_dict, edge_attr_dict)
             
             gripper_preds.append(grip_pred)
             
-            # Extract translation flow (first 3 dims)
-            velocity = flow[..., :3]  # [num_ghost, 3]
-            velocity = velocity.view(self.prediction_horizon, self.num_gripper_nodes, 3)
+            # Reshape flow to [horizon, 6, 6] (6 gripper nodes, 6D flow each)
+            flow = flow.view(self.prediction_horizon, self.num_gripper_nodes, 6)
             
-            # Integration step: x_{t-dt} = x_t - dt * v
-            ghost_positions = ghost_positions - dt.item() * velocity
-            position_history.append(ghost_positions.clone())
-        
-        # === Recover SE(3) using SVD (Arun's Method) ===
-        # For each timestep in horizon, compute the transform from live to target
-        final_positions = ghost_positions  # [horizon, 6, 3]
-        
-        # Compute transforms for each horizon step
-        actions = []
-        for h in range(self.prediction_horizon):
-            if h == 0:
-                # First action: transform from live gripper to first predicted position
-                source = live_gripper_pos  # [6, 3]
-                target = final_positions[h]  # [6, 3]
-            else:
-                # Subsequent actions: transform from previous to current
-                source = final_positions[h - 1]  # [6, 3]
-                target = final_positions[h]  # [6, 3]
+            # Average flow across gripper nodes
+            flow_avg = flow.mean(dim=1)  # [horizon, 6]
             
-            # SVD-based SE(3) recovery
-            T_rel = svd_se3_recovery(source, target)
-            actions.append(T_rel)
+            # Integration step in normalized se(3) space: xi_{t-dt} = xi_t - dt * v
+            current_xi_norm = current_xi_norm - dt.item() * flow_avg
         
-        actions = torch.stack(actions)  # [horizon, 4, 4]
+        # === Convert Final se(3) to SE(3) Actions ===
+        final_xi = self.action_normalizer.unnormalize(current_xi_norm)  # [horizon, 6]
+        final_actions_se3 = se3_exp_map(final_xi)  # [horizon, 4, 4]
+        
+        # These are T_EA (action in EE frame) - transforms relative to live pose
+        # To get absolute world poses: T_WA = T_WE @ T_EA
+        actions = final_actions_se3  # [horizon, 4, 4]
         
         # === Get Gripper Predictions ===
         final_grip = gripper_preds[-1].view(

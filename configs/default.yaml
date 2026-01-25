@@ -5,7 +5,7 @@
 model:
   # Geometry Encoder (PointNet++)
   geometry_encoder:
-    out_channels: 256
+    out_channels: 512  # Fixed: PointNet++ outputs 512-dim features per keypoint
     freeze: true  # Paper: geometry encoder should be frozen
   
   # Graph Transformer
