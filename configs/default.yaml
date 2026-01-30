@@ -70,7 +70,9 @@ data:
     trajectory_length: 20  # Steps per trajectory
   
   # Data loading
-  num_workers: 4
+  # Note: num_workers > 0 may cause segfaults with torch_geometric/scipy
+  # Set to 0 if you encounter "Segmentation fault" errors in DataLoader workers
+  num_workers: 0
   prefetch_factor: 2
 
 # Inference

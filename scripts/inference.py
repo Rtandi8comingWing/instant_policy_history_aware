@@ -6,6 +6,16 @@ to verify model functionality.
 
 Usage:
     python scripts/inference.py --checkpoint checkpoints/epoch=X-step=Y.ckpt
+
+Weight Loading Strategy:
+========================
+The .ckpt file (PyTorch Lightning checkpoint) contains the COMPLETE model state,
+including geometry_encoder weights. No separate model.pt is needed for inference.
+
+- Training: model.pt is used to initialize geometry_encoder before training starts
+- Inference: .ckpt contains all trained weights, including geometry_encoder
+- Resume Training: .ckpt completely overwrites model (including encoder), 
+                   so encoder_checkpoint is also not needed when resuming
 """
 
 import argparse
@@ -22,8 +32,20 @@ from ip_src.models import GraphDiffusion
 from ip_src.data import InstantPolicyDataset
 
 
-def load_model(checkpoint_path: str, encoder_checkpoint: str = None, device: str = "cuda"):
-    """Load model from Lightning checkpoint."""
+def load_model(checkpoint_path: str, device: str = "cuda"):
+    """
+    Load model from Lightning checkpoint.
+    
+    The .ckpt file contains the complete model state (including geometry_encoder),
+    so no separate encoder checkpoint is needed.
+    
+    Args:
+        checkpoint_path: Path to .ckpt file
+        device: Device to load model on
+    
+    Returns:
+        Loaded and ready-for-inference model
+    """
     print(f"Loading model from: {checkpoint_path}")
     
     # Load checkpoint
@@ -33,26 +55,31 @@ def load_model(checkpoint_path: str, encoder_checkpoint: str = None, device: str
     if 'hyper_parameters' in checkpoint:
         hparams = checkpoint['hyper_parameters'].copy()
         print(f"Found hyperparameters: {list(hparams.keys())}")
-        # Override device with the one specified by user
+        
+        # Override device
         hparams['device'] = device
+        
+        # IMPORTANT: Remove encoder_checkpoint to avoid redundant loading
+        # The .ckpt already contains trained encoder weights
+        hparams.pop('encoder_checkpoint', None)
     else:
         print("No hyperparameters found, using defaults")
         hparams = {'device': device}
     
-    # Create model
+    # Create model (without loading encoder from model.pt)
     model = GraphDiffusion(**hparams)
     
-    # Load state dict
+    # Load complete state dict from checkpoint
+    # This includes ALL weights: geometry_encoder, local_encoder, 
+    # context_aggregator, action_decoder, etc.
     if 'state_dict' in checkpoint:
-        # Filter out geometry_encoder if we're loading from pretrained
         state_dict = checkpoint['state_dict']
-        model.load_state_dict(state_dict, strict=False)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
         print(f"Loaded state dict with {len(state_dict)} keys")
-    
-    # Load encoder weights if provided separately
-    if encoder_checkpoint and Path(encoder_checkpoint).exists():
-        print(f"Loading encoder weights from: {encoder_checkpoint}")
-        model.load_encoder_weights(encoder_checkpoint)
+        if missing:
+            print(f"  Missing keys: {len(missing)}")
+        if unexpected:
+            print(f"  Unexpected keys: {len(unexpected)}")
     
     model = model.to(device)
     model.eval()
@@ -243,9 +270,7 @@ def compute_metrics(actions: np.ndarray, grips: np.ndarray,
 def main():
     parser = argparse.ArgumentParser(description="Instant Policy Inference")
     parser.add_argument("--checkpoint", type=str, required=True,
-                        help="Path to model checkpoint (.ckpt)")
-    parser.add_argument("--encoder_checkpoint", type=str, default="./model.pt",
-                        help="Path to encoder weights (model.pt)")
+                        help="Path to model checkpoint (.ckpt). Contains complete model weights.")
     parser.add_argument("--data_dir", type=str, default="./data/pseudo_demos",
                         help="Path to pseudo-demo data")
     parser.add_argument("--num_samples", type=int, default=5,
@@ -259,8 +284,8 @@ def main():
         print("CUDA not available, using CPU")
         args.device = "cpu"
     
-    # Load model
-    model = load_model(args.checkpoint, args.encoder_checkpoint, args.device)
+    # Load model (only needs .ckpt, no separate encoder checkpoint)
+    model = load_model(args.checkpoint, args.device)
     print(f"Model loaded successfully on {args.device}")
     
     # Set inference parameters

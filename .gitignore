@@ -88,3 +88,10 @@ htmlcov/
 *.tmp
 *.temp
 .cache/
+deploy_sim.py
+IMPLEMENTATION_GUIDE.md
+.gitignore
+sim_utils.py
+IMPLEMENTATION_GUIDE.md
+test_sim_interface.py
+IMPLEMENTATION_GUIDE.md

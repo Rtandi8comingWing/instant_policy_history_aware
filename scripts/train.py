@@ -6,11 +6,33 @@ Usage:
     # Generate pseudo-demonstrations first:
     python scripts/generate_pseudo_demos.py --output_dir ./data/pseudo_demos --num_tasks 1000
     
-    # Then train:
-    python scripts/train.py --config configs/default.yaml --data_dir ./data/pseudo_demos
+    # Then train with pseudo_demos:
+    python scripts/train.py --config configs/default.yaml --data_dir ./data/pseudo_demos --checkpoint_dir ./checkpoints/pseudo_demos
     
-    # Or train without wandb:
+    # Or train with shapenet_demos:
+    python scripts/train.py --config configs/default.yaml --data_dir ./data/shapenet_demos --checkpoint_dir ./checkpoints/shapenet_demos
+    
+    # Train without wandb:
     python scripts/train.py --config configs/default.yaml --data_dir ./data/pseudo_demos --no_wandb
+    
+    # Resume training from checkpoint:
+    python scripts/train.py --config configs/default.yaml --data_dir ./data/pseudo_demos --resume checkpoints/last.ckpt
+
+Weight Loading Strategy:
+========================
+1. Fresh Training (no --resume):
+   - geometry_encoder: loaded from model.pt (--encoder_checkpoint or config)
+   - Other modules: randomly initialized
+   - PyTorch Lightning saves complete model to .ckpt (including geometry_encoder)
+
+2. Resume Training (with --resume):
+   - ALL weights loaded from .ckpt (including geometry_encoder)
+   - --encoder_checkpoint is IGNORED because .ckpt completely overwrites the model
+   - Optimizer state, scheduler state, epoch/step counts are also restored
+
+3. Inference:
+   - Only .ckpt is needed (contains complete model)
+   - No need for separate model.pt
 """
 
 import argparse
@@ -61,6 +83,20 @@ def main():
         default=None,
         help="Path to pretrained model.pt for loading encoder weights",
     )
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default=None,
+        help="Directory to save checkpoints (overrides config). "
+             "Use different dirs for pseudo_demos vs shapenet_demos",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=None,
+        help="Number of DataLoader workers (overrides config). "
+             "Set to 0 if you encounter segfaults with torch_geometric/scipy",
+    )
     args = parser.parse_args()
 
     # Load configuration
@@ -104,14 +140,21 @@ def main():
     )
     print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
     
+    # Determine num_workers (CLI arg overrides config)
+    num_workers = args.num_workers if args.num_workers is not None else config["data"]["num_workers"]
+    prefetch_factor = config["data"].get("prefetch_factor", 2) if num_workers > 0 else None
+    
+    if num_workers == 0:
+        print("Note: Using num_workers=0 (single-process data loading)")
+    
     # Create dataloaders
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=config["training"]["batch_size"],
         shuffle=True,
-        num_workers=config["data"]["num_workers"],
-        prefetch_factor=config["data"].get("prefetch_factor", 2),
-        pin_memory=True,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+        pin_memory=True if num_workers > 0 else False,
         collate_fn=collate_fn,
     )
     
@@ -119,8 +162,9 @@ def main():
         val_dataset,
         batch_size=config["training"]["batch_size"],
         shuffle=False,
-        num_workers=config["data"]["num_workers"],
-        pin_memory=True,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+        pin_memory=True if num_workers > 0 else False,
         collate_fn=collate_fn,
     )
     
@@ -153,14 +197,18 @@ def main():
     )
     
     # === Setup Callbacks ===
+    # Use CLI checkpoint_dir if provided, otherwise use config
+    checkpoint_dir = args.checkpoint_dir or config["logging"]["checkpoint_dir"]
+    
     callbacks = [
         ModelCheckpoint(
-            dirpath=config["logging"]["checkpoint_dir"],
-            filename="instant_policy-{epoch:02d}-{val/flow_loss:.4f}",
+            dirpath=checkpoint_dir,
+            filename="instant_policy-epoch={epoch:02d}-val_loss={val/flow_loss:.4f}",
             save_top_k=3,
             monitor="val/flow_loss",
             mode="min",
             save_last=True,
+            auto_insert_metric_name=False,  # 禁止自动插入 metric 名称
         ),
         LearningRateMonitor(logging_interval="step"),
     ]
@@ -195,6 +243,7 @@ def main():
     print(f"  Epochs: {config['training']['num_epochs']}")
     print(f"  Batch size: {config['training']['batch_size']}")
     print(f"  Learning rate: {training_config.get('optimizer', {}).get('lr', 1e-5)}")
+    print(f"  Checkpoint dir: {checkpoint_dir}")
     
     trainer.fit(
         model,
